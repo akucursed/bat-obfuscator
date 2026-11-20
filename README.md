@@ -18,6 +18,6 @@ obfuscator.exe input.bat -o output.bat [flags]
 - `--layers <1-5>`: recursive obfuscation layers (default `2`)
 - `--junk <0-10>`: junk variables and dead code amount (default `5`)
 - `--seed <uint32>`: deterministic rng seed (random if omitted)
-- `--zalgo`: inject zalgo noise comments (default `off`)
+- `--zalgo`: inject zalgo noise comments (default `on`)
 - `--no-flatten`: disable control flow flattening (default `enabled`)
 - `--no-anti-tamper`: disable file-size integrity check (default `enabled`)
