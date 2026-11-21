@@ -1,6 +1,7 @@
 #define NOMINMAX
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#pragma comment(lib, "user32.lib")
 #include <algorithm>
 #include <cctype>
 #include <cstdint>
@@ -324,7 +325,19 @@ static std::vector<Token> scan_tokens(std::string_view s) {
                 in_q = true;
                 ++i;
                 break;
-            case '(':
+            case '(': {
+                std::string cl;
+                for (char c : cur) if (c != '^') cl.push_back(std::tolower(static_cast<unsigned char>(c)));
+                if (cl == "echo" || cl == "@echo") {
+                    cur.push_back(ch);
+                    ++i;
+                    break;
+                }
+                flush_word();
+                tokens.push_back({"PAREN", std::string(1, ch)});
+                ++i;
+                break;
+            }
             case ')':
                 flush_word();
                 tokens.push_back({"PAREN", std::string(1, ch)});
@@ -389,23 +402,17 @@ static std::vector<Token> scan_tokens(std::string_view s) {
 }
 
 class Parser {
-    std::vector<std::string> lines;
-    size_t pos = 0;
+    std::vector<Token> toks;
+    size_t idx = 0;
 
 public:
-    explicit Parser(std::vector<std::string> l) : lines(std::move(l)) {}
-
-    std::vector<std::unique_ptr<Node>> parse() {
-        std::vector<std::unique_ptr<Node>> nodes;
-        while (pos < lines.size()) {
-            std::string line = lines[pos++];
+    explicit Parser(const std::vector<std::string>& raw_lines) {
+        for (const auto& line : raw_lines) {
             std::string st = trim(line);
             if (st.empty()) continue;
             if (st.rfind("::", 0) == 0) {
-                auto nd = std::make_unique<Node>(NodeKind::RawLine);
-                nd->text = line;
-                nd->raw_kind = "comment";
-                nodes.push_back(std::move(nd));
+                toks.push_back({"COMMENT", line});
+                toks.push_back({"NEWLINE", "\n"});
                 continue;
             }
             if (st[0] == ':') {
@@ -416,38 +423,69 @@ public:
                     iss >> lbl;
                 }
                 if (!lbl.empty()) {
-                    auto nd = std::make_unique<Node>(NodeKind::Label);
-                    nd->name = lbl;
-                    nodes.push_back(std::move(nd));
+                    toks.push_back({"LABEL", lbl});
                 } else {
-                    auto nd = std::make_unique<Node>(NodeKind::RawLine);
-                    nd->text = line;
-                    nd->raw_kind = "comment";
-                    nodes.push_back(std::move(nd));
+                    toks.push_back({"COMMENT", line});
                 }
+                toks.push_back({"NEWLINE", "\n"});
                 continue;
             }
-            auto nd = parse_stmt_line(st);
+            auto line_toks = scan_tokens(st);
+            for (auto& t : line_toks) toks.push_back(std::move(t));
+            toks.push_back({"NEWLINE", "\n"});
+        }
+    }
+
+    void skip_newlines() {
+        while (idx < toks.size() && toks[idx].type == "NEWLINE") ++idx;
+    }
+
+    std::vector<std::unique_ptr<Node>> parse() {
+        std::vector<std::unique_ptr<Node>> nodes;
+        while (true) {
+            skip_newlines();
+            if (idx >= toks.size()) break;
+
+            if (toks[idx].type == "COMMENT") {
+                auto nd = std::make_unique<Node>(NodeKind::RawLine);
+                nd->text = toks[idx].val;
+                nd->raw_kind = "comment";
+                ++idx;
+                nodes.push_back(std::move(nd));
+                continue;
+            }
+
+            if (toks[idx].type == "LABEL") {
+                auto nd = std::make_unique<Node>(NodeKind::Label);
+                nd->name = toks[idx].val;
+                ++idx;
+                nodes.push_back(std::move(nd));
+                continue;
+            }
+
+            size_t before = idx;
+            auto nd = parse_compound(false);
             if (nd) nodes.push_back(std::move(nd));
+            if (idx == before) ++idx;
         }
         return nodes;
     }
 
 private:
-    std::unique_ptr<Node> parse_stmt_line(const std::string& st) {
-        auto toks = scan_tokens(st);
-        if (toks.empty()) return nullptr;
-        size_t idx = 0;
-        return parse_compound(toks, idx);
-    }
-
-    std::unique_ptr<Node> parse_compound(const std::vector<Token>& toks, size_t& idx) {
+    std::unique_ptr<Node> parse_compound(bool in_block) {
         std::vector<std::unique_ptr<Node>> stmts;
         std::vector<std::string> ops;
         while (idx < toks.size()) {
+            if (toks[idx].type == "NEWLINE") break;
             if (toks[idx].type == "PAREN" && toks[idx].val == ")") break;
-            auto nd = parse_single(toks, idx);
+            if (toks[idx].type == "WORD" && to_lower(toks[idx].val) == "else") break;
+            if (toks[idx].type == "COMMENT" || toks[idx].type == "LABEL") break;
+
+            size_t before = idx;
+            auto nd = parse_single(in_block);
             if (nd) stmts.push_back(std::move(nd));
+            if (idx == before) ++idx;
+
             if (idx < toks.size() && toks[idx].type == "OP") {
                 ops.push_back(toks[idx].val);
                 ++idx;
@@ -455,6 +493,7 @@ private:
                 break;
             }
         }
+        if (stmts.empty()) return nullptr;
         if (stmts.size() == 1 && ops.empty()) return std::move(stmts[0]);
         auto blk = std::make_unique<Node>(NodeKind::Block);
         blk->stmts = std::move(stmts);
@@ -462,48 +501,47 @@ private:
         return blk;
     }
 
-    std::unique_ptr<Node> collect_paren_block(std::vector<Token> toks, size_t& idx) {
-        ++idx;
+    std::unique_ptr<Node> parse_block() {
+        if (idx < toks.size() && toks[idx].type == "PAREN" && toks[idx].val == "(") {
+            ++idx;
+        }
         auto blk = std::make_unique<Node>(NodeKind::Block);
-        std::vector<Token> cur_toks;
-        int depth = 1;
         while (true) {
-            while (idx < toks.size()) {
-                const auto& tt = toks[idx].type;
-                const auto& tv = toks[idx].val;
-                if (tt == "PAREN" && tv == "(") {
-                    ++depth;
-                    cur_toks.push_back(toks[idx++]);
-                } else if (tt == "PAREN" && tv == ")") {
-                    --depth;
-                    if (depth == 0) {
-                        ++idx;
-                        if (!cur_toks.empty()) {
-                            size_t cidx = 0;
-                            blk->stmts.push_back(parse_compound(cur_toks, cidx));
-                        }
-                        return blk;
-                    }
-                    cur_toks.push_back(toks[idx++]);
-                } else {
-                    cur_toks.push_back(toks[idx++]);
-                }
+            skip_newlines();
+            if (idx >= toks.size()) break;
+            if (toks[idx].type == "PAREN" && toks[idx].val == ")") {
+                ++idx;
+                break;
             }
-            if (!cur_toks.empty()) {
-                size_t cidx = 0;
-                blk->stmts.push_back(parse_compound(cur_toks, cidx));
-                cur_toks.clear();
+            if (toks[idx].type == "COMMENT") {
+                auto nd = std::make_unique<Node>(NodeKind::RawLine);
+                nd->text = toks[idx].val;
+                nd->raw_kind = "comment";
+                ++idx;
+                blk->stmts.push_back(std::move(nd));
+                continue;
             }
-            if (pos >= lines.size()) break;
-            std::string nl = trim(lines[pos++]);
-            if (nl.empty() || nl.rfind("::", 0) == 0) continue;
-            toks = scan_tokens(nl);
-            idx = 0;
+            if (toks[idx].type == "LABEL") {
+                auto nd = std::make_unique<Node>(NodeKind::Label);
+                nd->name = toks[idx].val;
+                ++idx;
+                blk->stmts.push_back(std::move(nd));
+                continue;
+            }
+            size_t before = idx;
+            auto stmt = parse_compound(true);
+            if (stmt) blk->stmts.push_back(std::move(stmt));
+            if (idx == before) ++idx;
+        }
+        while (idx < toks.size() && toks[idx].type == "REDIR") {
+            std::string r = toks[idx++].val;
+            if (idx < toks.size() && toks[idx].type == "REDIR_TGT") r += " " + toks[idx++].val;
+            blk->redirects.push_back(r);
         }
         return blk;
     }
 
-    std::unique_ptr<Node> parse_single(std::vector<Token> toks, size_t& idx) {
+    std::unique_ptr<Node> parse_single(bool in_block) {
         if (idx >= toks.size()) return nullptr;
         bool silent = false;
         if (toks[idx].type == "WORD" && !toks[idx].val.empty() && toks[idx].val[0] == '@') {
@@ -513,31 +551,31 @@ private:
             else ++idx;
         }
         if (idx >= toks.size()) return nullptr;
+
         if (toks[idx].type == "PAREN" && toks[idx].val == "(") {
-            auto blk = collect_paren_block(toks, idx);
-            while (idx < toks.size() && toks[idx].type == "REDIR") {
-                std::string r = toks[idx++].val;
-                if (idx < toks.size() && toks[idx].type == "REDIR_TGT") r += " " + toks[idx++].val;
-                blk->redirects.push_back(r);
-            }
+            auto blk = parse_block();
             blk->silent = silent;
             return blk;
         }
+
         if (toks[idx].type != "WORD") {
             std::vector<std::string> rest;
-            for (size_t j = idx; j < toks.size(); ++j) rest.push_back(toks[j].val);
-            idx = toks.size();
+            while (idx < toks.size() && toks[idx].type != "NEWLINE" && toks[idx].type != "OP" && !(toks[idx].type == "PAREN" && toks[idx].val == ")")) {
+                rest.push_back(toks[idx++].val);
+            }
             auto nd = std::make_unique<Node>(NodeKind::RawLine);
             nd->text = join_vec(rest, " ");
             nd->raw_kind = "raw";
             return nd;
         }
-        std::string tv = toks[idx].val;
+
+        std::string tv = toks[idx++].val;
         std::string kw = to_lower(tv);
         if (kw == "rem") {
             std::vector<std::string> rest;
-            for (size_t j = idx; j < toks.size(); ++j) rest.push_back(toks[j].val);
-            idx = toks.size();
+            while (idx < toks.size() && toks[idx].type != "NEWLINE") {
+                rest.push_back(toks[idx++].val);
+            }
             auto nd = std::make_unique<Node>(NodeKind::RawLine);
             nd->text = join_vec(rest, " ");
             nd->raw_kind = "comment";
@@ -545,18 +583,18 @@ private:
         }
         if (kw == "setlocal" || kw == "endlocal") {
             std::vector<std::string> rest;
-            for (size_t j = idx; j < toks.size(); ++j) rest.push_back(toks[j].val);
-            idx = toks.size();
+            while (idx < toks.size() && toks[idx].type != "NEWLINE" && toks[idx].type != "OP" && !(toks[idx].type == "PAREN" && toks[idx].val == ")")) {
+                rest.push_back(toks[idx++].val);
+            }
             auto nd = std::make_unique<Node>(NodeKind::RawLine);
-            nd->text = (silent ? "@" : "") + join_vec(rest, " ");
+            nd->text = (silent ? "@" : "") + tv + (rest.empty() ? "" : " " + join_vec(rest, " "));
             nd->raw_kind = kw;
             return nd;
         }
-        if (kw == "if") { ++idx; return parse_if(toks, idx, silent); }
-        if (kw == "for") { ++idx; return parse_for(toks, idx, silent); }
+        if (kw == "if") { return parse_if(silent); }
+        if (kw == "for") { return parse_for(silent); }
         if (kw == "goto") {
-            ++idx;
-            if (idx < toks.size()) {
+            if (idx < toks.size() && toks[idx].type != "NEWLINE") {
                 std::string tgt = toks[idx++].val;
                 std::string tl = to_lower(tgt);
                 auto nd = std::make_unique<Node>(NodeKind::Goto);
@@ -570,22 +608,39 @@ private:
             nd->raw_kind = "raw";
             return nd;
         }
-        if (kw == "call") { ++idx; return parse_call(toks, idx, silent); }
-        if (kw == "set") { ++idx; return parse_set(toks, idx, silent); }
+        if (kw == "call") { return parse_call(silent); }
+        if (kw == "set") { return parse_set(silent); }
 
+        bool is_echo = (kw == "echo");
+        int paren_depth = 0;
         std::vector<std::string> args, reds;
-        size_t j = idx + 1;
-        while (j < toks.size()) {
-            if (toks[j].type == "OP" || (toks[j].type == "PAREN" && toks[j].val == ")")) break;
-            if (toks[j].type == "REDIR") {
-                std::string r = toks[j++].val;
-                if (j < toks.size() && toks[j].type == "REDIR_TGT") r += " " + toks[j++].val;
+        while (idx < toks.size()) {
+            if (toks[idx].type == "NEWLINE" || toks[idx].type == "OP") break;
+            if (toks[idx].type == "PAREN") {
+                if (toks[idx].val == "(") {
+                    ++paren_depth;
+                    args.push_back("(");
+                    ++idx;
+                    continue;
+                } else if (toks[idx].val == ")") {
+                    if (paren_depth > 0 || (is_echo && !in_block)) {
+                        if (paren_depth > 0) --paren_depth;
+                        args.push_back(")");
+                        ++idx;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if (toks[idx].type == "REDIR") {
+                std::string r = toks[idx++].val;
+                if (idx < toks.size() && toks[idx].type == "REDIR_TGT") r += " " + toks[idx++].val;
                 reds.push_back(r);
             } else {
-                args.push_back(toks[j++].val);
+                args.push_back(toks[idx++].val);
             }
         }
-        idx = j;
         auto nd = std::make_unique<Node>(NodeKind::Command);
         nd->name = tv;
         nd->arg_list = args;
@@ -595,7 +650,7 @@ private:
         return nd;
     }
 
-    std::unique_ptr<Node> parse_set(const std::vector<Token>& toks, size_t& idx, bool silent) {
+    std::unique_ptr<Node> parse_set(bool silent) {
         std::string mode;
         if (idx < toks.size() && toks[idx].type == "WORD") {
             std::string ml = to_lower(toks[idx].val);
@@ -605,8 +660,26 @@ private:
             }
         }
         std::vector<std::string> parts;
+        int paren_depth = 0;
         while (idx < toks.size()) {
-            if (toks[idx].type == "OP" || (toks[idx].type == "PAREN" && toks[idx].val == ")")) break;
+            if (toks[idx].type == "NEWLINE" || toks[idx].type == "OP") break;
+            if (toks[idx].type == "PAREN") {
+                if (toks[idx].val == "(") {
+                    ++paren_depth;
+                    parts.push_back("(");
+                    ++idx;
+                    continue;
+                } else if (toks[idx].val == ")") {
+                    if (paren_depth > 0) {
+                        --paren_depth;
+                        parts.push_back(")");
+                        ++idx;
+                        continue;
+                    } else {
+                        break;
+                    }
+                }
+            }
             parts.push_back(toks[idx++].val);
         }
         std::string joined = join_vec(parts, " ");
@@ -635,16 +708,16 @@ private:
         return nd;
     }
 
-    std::unique_ptr<Node> parse_call(const std::vector<Token>& toks, size_t& idx, bool silent) {
+    std::unique_ptr<Node> parse_call(bool silent) {
         auto nd = std::make_unique<Node>(NodeKind::Call);
         nd->silent = silent;
-        if (idx >= toks.size()) return nd;
+        if (idx >= toks.size() || toks[idx].type == "NEWLINE") return nd;
         std::string tgt = toks[idx++].val;
         nd->is_label = (!tgt.empty() && tgt[0] == ':');
         nd->target = nd->is_label ? tgt.substr(1) : tgt;
         std::vector<std::string> args;
         while (idx < toks.size()) {
-            if (toks[idx].type == "OP" || (toks[idx].type == "PAREN" && toks[idx].val == ")")) break;
+            if (toks[idx].type == "NEWLINE" || toks[idx].type == "OP" || (toks[idx].type == "PAREN" && toks[idx].val == ")")) break;
             if (toks[idx].type == "REDIR") {
                 std::string r = toks[idx++].val;
                 if (idx < toks.size() && toks[idx].type == "REDIR_TGT") r += " " + toks[idx++].val;
@@ -657,7 +730,7 @@ private:
         return nd;
     }
 
-    std::unique_ptr<Node> parse_if(const std::vector<Token>& toks, size_t& idx, bool silent) {
+    std::unique_ptr<Node> parse_if(bool silent) {
         bool ci = false, neg = false;
         while (idx < toks.size() && toks[idx].type == "WORD") {
             std::string wl = to_lower(toks[idx].val);
@@ -665,7 +738,7 @@ private:
             else if (wl == "not") { neg = true; ++idx; }
             else break;
         }
-        if (idx >= toks.size()) {
+        if (idx >= toks.size() || toks[idx].type == "NEWLINE") {
             auto nd = std::make_unique<Node>(NodeKind::RawLine);
             nd->text = "if";
             nd->raw_kind = "raw";
@@ -679,14 +752,16 @@ private:
         if (wl == "exist" || wl == "defined" || wl == "errorlevel" || wl == "cmdextversion") {
             nd->ctype = wl;
             ++idx;
-            if (idx < toks.size()) nd->cargs.push_back(toks[idx++].val);
+            if (idx < toks.size() && toks[idx].type != "NEWLINE" && (toks[idx].type != "PAREN" || toks[idx].val != "(")) {
+                nd->cargs.push_back(toks[idx++].val);
+            }
         } else {
             std::string lhs = toks[idx++].val;
             size_t deq = lhs.find("==");
             if (deq != std::string::npos && lhs[0] != '"' && lhs != "==") {
                 nd->ctype = "==";
                 nd->cargs = {lhs.substr(0, deq), lhs.substr(deq + 2)};
-            } else if (idx < toks.size()) {
+            } else if (idx < toks.size() && toks[idx].type == "WORD") {
                 std::string op = to_lower(toks[idx].val);
                 if (op == "==" || op == "equ" || op == "neq" || op == "lss" || op == "leq" || op == "gtr" || op == "geq") {
                     nd->ctype = op;
@@ -702,22 +777,28 @@ private:
             }
         }
         if (idx < toks.size() && toks[idx].type == "PAREN" && toks[idx].val == "(") {
-            nd->then_b = collect_paren_block(toks, idx);
+            nd->then_b = parse_block();
         } else {
-            nd->then_b = parse_compound(toks, idx);
+            nd->then_b = parse_compound(false);
         }
+        size_t saved_idx = idx;
+        skip_newlines();
         if (idx < toks.size() && toks[idx].type == "WORD" && to_lower(toks[idx].val) == "else") {
             ++idx;
             if (idx < toks.size() && toks[idx].type == "PAREN" && toks[idx].val == "(") {
-                nd->else_b = collect_paren_block(toks, idx);
+                nd->else_b = parse_block();
             } else {
-                nd->else_b = parse_compound(toks, idx);
+                nd->else_b = parse_compound(false);
+            }
+        } else {
+            if (!nd->then_b || nd->then_b->kind != NodeKind::Block) {
+                idx = saved_idx;
             }
         }
         return nd;
     }
 
-    std::unique_ptr<Node> parse_for(const std::vector<Token>& toks, size_t& idx, bool silent) {
+    std::unique_ptr<Node> parse_for(bool silent) {
         auto nd = std::make_unique<Node>(NodeKind::For);
         nd->silent = silent;
         while (idx < toks.size() && toks[idx].type == "WORD") {
@@ -726,7 +807,7 @@ private:
             if (wl == "/l" || wl == "/f" || wl == "/d" || wl == "/r") {
                 nd->mode = wl;
                 ++idx;
-            } else if (wl.rfind("%%", 0) == 0) {
+            } else if (wl.rfind("%%", 0) == 0 || wl.rfind("%", 0) == 0) {
                 break;
             } else {
                 nd->opts.push_back(w);
@@ -746,6 +827,8 @@ private:
                 } else if (toks[idx].type == "PAREN" && toks[idx].val == ")") {
                     --depth;
                     if (depth > 0) dataset.push_back(toks[idx].val);
+                } else if (toks[idx].type == "NEWLINE") {
+                    dataset.push_back(" ");
                 } else {
                     dataset.push_back(toks[idx].val);
                 }
@@ -755,9 +838,9 @@ private:
         nd->dataset = join_vec(dataset, " ");
         if (idx < toks.size() && to_lower(toks[idx].val) == "do") ++idx;
         if (idx < toks.size() && toks[idx].type == "PAREN" && toks[idx].val == "(") {
-            nd->body = collect_paren_block(toks, idx);
+            nd->body = parse_block();
         } else {
-            nd->body = parse_compound(toks, idx);
+            nd->body = parse_compound(false);
         }
         return nd;
     }
@@ -779,7 +862,7 @@ public:
 
     PolyEngine(std::mt19937& r, int jl, bool en, std::unordered_set<std::string>* shared)
         : rng(r), junk_level(jl), enabled(en), used_names(shared ? shared : &local_names) {
-        std::string dc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 .,:;/-_=()\\";
+        std::string dc = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-/";
         for (char ch : dc) char_map[ch] = gen_name(5, 8);
         int jc = std::max(4, junk_level * 2);
         for (int i = 0; i < jc; ++i) junk_names.push_back(gen_name(5, 8));
@@ -1004,6 +1087,7 @@ public:
         if (vm_level <= 0 || !n) return false;
         if (n->kind == NodeKind::Set) {
             if (n->mode == "/p") return false;
+            if (n->expr.empty()) return false;
             if (n->expr.find('%') != std::string::npos || n->expr.find('!') != std::string::npos) return false;
             if (n->name.find('%') != std::string::npos || n->name.find('!') != std::string::npos) return false;
             for (char c : n->name) if (tbl_idx.find(c) == tbl_idx.end()) return false;
@@ -1012,8 +1096,10 @@ public:
         }
         if (n->kind == NodeKind::Command) {
             if (!n->redirects.empty() || n->raw.find('%') != std::string::npos || n->raw.find('!') != std::string::npos) return false;
+            if (n->raw.find('&') != std::string::npos || n->raw.find('|') != std::string::npos || n->raw.find('>') != std::string::npos || n->raw.find('<') != std::string::npos) return false;
             std::string nl = to_lower(n->name);
-            if (nl == "exit" || nl == "shift" || nl == "setlocal" || nl == "endlocal") return false;
+            if (nl == "exit" || nl == "shift" || nl == "setlocal" || nl == "endlocal" || nl == "goto" || nl == "call") return false;
+            if (to_lower(n->raw).find("echo(") != std::string::npos) return false;
             for (char c : n->raw) if (tbl_idx.find(c) == tbl_idx.end()) return false;
             return true;
         }
@@ -1077,6 +1163,7 @@ public:
 
         lines.push_back(":" + dec_lbl);
         lines.push_back(kw_set + " \"" + v_acc + "=\"");
+        lines.push_back("if not defined " + v_tmp + " " + kw_exit + " /b 0");
         lines.push_back(kw_set + " /a \"" + v_key + "=" + expr_seed + "\"");
         if (!sz_var.empty()) {
             lines.push_back(kw_set + " /a \"" + v_reg2 + "=" + sz_var + " & 4095\"");
@@ -1353,15 +1440,29 @@ private:
                 std::string reds = n->redirects.empty() ? "" : " " + join_vec(n->redirects, " ");
                 return pre + poly.obf_cmd_name("call") + " " + tgt + args + reds;
             }
-            case NodeKind::Set:
-                if (n->mode == "/a") return pre + poly.obf_cmd_name("set") + " /a " + n->name + "=" + n->expr;
+            case NodeKind::Set: {
+                if (n->mode == "/a") {
+                    std::string full_expr = trim(n->name) + "=" + trim(n->expr);
+                    if (full_expr.size() >= 2 && full_expr.front() == '"' && full_expr.back() == '"') {
+                        return pre + poly.obf_cmd_name("set") + " /a " + full_expr;
+                    }
+                    return pre + poly.obf_cmd_name("set") + " /a \"" + full_expr + "\"";
+                }
                 if (n->mode == "/p") return pre + poly.obf_cmd_name("set") + " /p " + n->name + "=" + n->expr;
                 if (n->mode == "quoted") return pre + poly.obf_cmd_name("set") + " \"" + n->name + "=" + poly.obf_text(n->expr, false, true, true) + "\"";
                 return pre + poly.obf_cmd_name("set") + " " + n->name + "=" + poly.obf_text(n->expr, false, true);
+            }
             case NodeKind::Command: {
-                std::string cmd_obf = poly.obf_cmd_name(n->name);
+                std::string cmd_name_clean;
+                for (char c : n->name) if (c != '^') cmd_name_clean.push_back(std::tolower(static_cast<unsigned char>(c)));
+                std::string cmd_obf;
+                if (cmd_name_clean == "echo." || cmd_name_clean == "echo/" || cmd_name_clean == "echo\\" || cmd_name_clean == "echo:" || cmd_name_clean == "echo(" || cmd_name_clean == "echo;" || cmd_name_clean == "echo,") {
+                    cmd_obf = "e^c^h^o" + cmd_name_clean.substr(4);
+                } else {
+                    cmd_obf = poly.obf_cmd_name(n->name);
+                }
                 std::string joined_args = join_vec(n->arg_list, " ");
-                std::string arg_str = joined_args.empty() ? "" : " " + poly.obf_text(joined_args, false, to_lower(n->name) != "echo");
+                std::string arg_str = joined_args.empty() ? "" : " " + poly.obf_text(joined_args, false, cmd_name_clean != "echo");
                 std::string red_str = n->redirects.empty() ? "" : " " + join_vec(n->redirects, " ");
                 return pre + cmd_obf + arg_str + red_str;
             }
@@ -1372,6 +1473,7 @@ private:
                         std::string r = render_node(s.get(), true);
                         if (!r.empty()) parts.push_back(r);
                     }
+                    if (parts.empty()) return "(call )";
                     std::string red_str = n->redirects.empty() ? "" : " " + join_vec(n->redirects, " ");
                     return pre + "(" + join_vec(parts, " & ") + ")" + red_str;
                 }
@@ -1404,7 +1506,11 @@ private:
                     parts.push_back("else");
                     parts.push_back(eb);
                 }
-                return join_vec(parts, " ");
+                std::string if_rendered = join_vec(parts, " ");
+                if (in_block) {
+                    return "(" + if_rendered + ")";
+                }
+                return if_rendered;
             }
             case NodeKind::For: {
                 std::vector<std::string> parts = {pre + "for"};
@@ -1423,6 +1529,43 @@ private:
         return "";
     }
 
+    bool is_unsafe_for_flatten(const Node* n) const {
+        if (!n) return false;
+        if (n->kind == NodeKind::Label || n->kind == NodeKind::For || n->kind == NodeKind::If ||
+            n->kind == NodeKind::Goto || n->kind == NodeKind::Call) return true;
+        if (n->kind == NodeKind::Command) {
+            std::string nl = to_lower(n->name);
+            if (nl == "exit" || nl == "call" || nl == "goto") return true;
+        }
+        if (n->kind == NodeKind::RawLine) {
+            if (n->raw_kind == "setlocal" || n->raw_kind == "endlocal") return true;
+        }
+        if (n->kind == NodeKind::Block) {
+            if (!n->ops.empty()) return true;
+            for (const auto& s : n->stmts) {
+                if (is_unsafe_for_flatten(s.get())) return true;
+            }
+        }
+        auto has_unsafe_chars = [](const std::string& s) {
+            bool q = false;
+            for (size_t k = 0; k < s.size(); ++k) {
+                if (s[k] == '^') { ++k; continue; }
+                if (s[k] == '"') q = !q;
+                else if (!q) {
+                    if (s[k] == '(' || s[k] == ')') return true;
+                    if (s[k] == '&' || s[k] == '|' || s[k] == '<' || s[k] == '>') return true;
+                    if (s[k] == '%') {
+                        if (k + 1 < s.size() && s[k + 1] == '%') { ++k; continue; }
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        if (has_unsafe_chars(n->raw) || has_unsafe_chars(n->expr) || has_unsafe_chars(n->text) || has_unsafe_chars(n->args)) return true;
+        return false;
+    }
+
     std::vector<std::string> emit_flattened(const std::vector<const Node*>& nodes) {
         if (!flatten || nodes.size() < 3) {
             std::vector<std::string> lines;
@@ -1436,7 +1579,8 @@ private:
         std::vector<Chunk> chunks;
         std::vector<const Node*> cur;
         for (const Node* n : nodes) {
-            if (n->kind == NodeKind::Label || (n->kind == NodeKind::RawLine && (n->raw_kind == "setlocal" || n->raw_kind == "endlocal"))) {
+            bool break_chunk = is_unsafe_for_flatten(n);
+            if (break_chunk) {
                 if (!cur.empty()) {
                     chunks.push_back({false, nullptr, cur});
                     cur.clear();
@@ -1449,8 +1593,6 @@ private:
         if (!cur.empty()) chunks.push_back({false, nullptr, cur});
 
         std::vector<std::string> out;
-        std::string st_var = poly.gen_name(5, 8);
-        std::string op_var = poly.gen_name(5, 8);
         std::vector<int> pool(8999);
         std::iota(pool.begin(), pool.end(), 1000);
 
@@ -1467,6 +1609,8 @@ private:
                 }
                 continue;
             }
+            std::string st_var = poly.gen_name(5, 8);
+            std::string op_var = poly.gen_name(5, 8);
             std::shuffle(pool.begin(), pool.end(), rng);
             std::vector<int> states(pool.begin(), pool.begin() + static_cast<ptrdiff_t>(ch.blk.size() + 1));
             std::string disp_lbl = poly.gen_name(5, 8);
@@ -1499,12 +1643,12 @@ private:
     }
 
     std::string zalgo_line(const std::string& encoding) {
-        if (encoding == "utf-8" || encoding == "utf-16le") {
-            static const char* z_base = "Il1O0_@#*~";
+        if (encoding == "utf-16le") {
+            static const char* z_base = "Il1O0_#*";
             int len = poly.rand_int(8, 16);
-            std::string out = ":: ";
+            std::string out = "@rem ";
             for (int i = 0; i < len; ++i) {
-                out.push_back(z_base[poly.rand_int(0, 9)]);
+                out.push_back(z_base[poly.rand_int(0, 7)]);
                 int mc = poly.rand_int(2, 5);
                 for (int m = 0; m < mc; ++m) {
                     int cp = poly.rand_int(0x0300, 0x033F);
@@ -1514,10 +1658,10 @@ private:
             }
             return out;
         }
-        static const char* z_noise = "Il1O0_@#*~:;+-=";
-        int len = poly.rand_int(14, 28);
-        std::string out = ":: ";
-        for (int i = 0; i < len; ++i) out.push_back(z_noise[poly.rand_int(0, 14)]);
+        static const char* z_noise = "Il1O0_#*";
+        int len = poly.rand_int(16, 32);
+        std::string out = "@rem ";
+        for (int i = 0; i < len; ++i) out.push_back(z_noise[poly.rand_int(0, 7)]);
         return out;
     }
 
@@ -1529,6 +1673,7 @@ private:
         for (size_t idx = 0; idx < lines.size(); ++idx) {
             out.push_back(lines[idx]);
             std::string s = trim(lines[idx]);
+            if (!s.empty() && s[0] == ':') continue;
             bool in_q = false;
             for (char ch : s) {
                 if (ch == '"') in_q = !in_q;
@@ -1544,9 +1689,14 @@ private:
 
     std::string build_pass(const std::vector<std::unique_ptr<Node>>& raw_nodes, const std::string& encoding, int sz_mod, const std::string& tamper_val, bool use_tamper) {
         std::vector<const Node*> ast_nodes;
+        bool has_disable_delayed = false;
         for (size_t idx_n = 0; idx_n < raw_nodes.size(); ++idx_n) {
             const Node* n = raw_nodes[idx_n].get();
-            if (n->kind == NodeKind::RawLine && n->raw_kind == "setlocal" && to_lower(n->text).find("enabledelayedexpansion") != std::string::npos) continue;
+            if (n->kind == NodeKind::RawLine && n->raw_kind == "setlocal") {
+                std::string tl = to_lower(n->text);
+                if (idx_n <= 1 && tl.find("enabledelayedexpansion") != std::string::npos) continue;
+                if (tl.find("disabledelayedexpansion") != std::string::npos) has_disable_delayed = true;
+            }
             if (idx_n == 0 && n->kind == NodeKind::Command && to_lower(n->name) == "echo" && n->arg_list.size() == 1 && to_lower(n->arg_list[0]) == "off") continue;
             ast_nodes.push_back(n);
         }
@@ -1560,7 +1710,12 @@ private:
         }
 
         std::vector<std::string> body_lines;
-        if (vm_level > 0) {
+        if (has_disable_delayed) {
+            for (const Node* n : ast_nodes) {
+                std::string r = render_node(n);
+                if (!r.empty()) body_lines.push_back(r);
+            }
+        } else if (vm_level > 0) {
             BatchVM probe(rng, poly, raw_sz_var, junk_level);
             size_t i = 0, n_len = ast_nodes.size();
             while (i < n_len) {
@@ -1640,7 +1795,7 @@ static std::string run_layers(const std::string& src_text, int vm_level, int jun
         uint32_t layer_seed = rng_base();
         bool is_first = (idx == 0);
         bool is_last = (idx == layers - 1);
-        Obfuscator obf(is_first ? vm_level : 0, junk_level, layer_seed, flatten, anti_tamper && is_last, zalgo && is_last, is_last, &shared_names);
+        Obfuscator obf(is_first ? vm_level : 0, junk_level, layer_seed, is_first ? flatten : false, anti_tamper && is_last, zalgo && is_last, is_last, &shared_names);
         std::string raw_bytes = obf.obfuscate(cur, is_last ? encoding : "utf-8", anti_tamper && is_last);
         stats.labels += obf.last_labels;
         stats.vm_insns += obf.last_vm_insns;
@@ -1904,10 +2059,17 @@ int main(int argc, char* argv[]) {
         else if (a == "--zalgo") zalgo = true;
         else if (a == "--no-flatten") flatten = false;
         else if (a == "--no-anti-tamper") anti_tamper = false;
-        else if (a[0] != '-') in_path = a;
+        else if (a[0] != '-') {
+            if (in_path.empty()) in_path = a;
+            else if (out_path.empty()) out_path = a;
+        }
     }
 
-    if (in_path.empty() || out_path.empty()) return 1;
+    if (in_path.empty()) return 1;
+    if (out_path.empty()) {
+        size_t dot = in_path.find_last_of('.');
+        out_path = (dot != std::string::npos) ? (in_path.substr(0, dot) + "_obf" + in_path.substr(dot)) : (in_path + "_obf.bat");
+    }
     std::string src;
     if (!read_file_bytes(in_path, src)) return 1;
 
